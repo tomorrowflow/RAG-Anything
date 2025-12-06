@@ -890,7 +890,21 @@ class MineruParser(Parser):
 
             base_output_dir.mkdir(parents=True, exist_ok=True)
 
-            # Run mineru command
+            # Run mineru command with device from config or kwargs
+            device = kwargs.get("device", None)
+            if not device:
+                # Try to get device from config if available
+                try:
+                    from raganything.config import RAGAnythingConfig
+                    default_config = RAGAnythingConfig()
+                    device = default_config.device
+                except ImportError:
+                    # Fallback to cuda:0 if config is not available
+                    device = "cuda:0"
+            
+            # Add device to kwargs for mineru command
+            kwargs["device"] = device
+            
             self._run_mineru_command(
                 input_path=pdf_path,
                 output_dir=base_output_dir,
@@ -1034,7 +1048,21 @@ class MineruParser(Parser):
             base_output_dir.mkdir(parents=True, exist_ok=True)
 
             try:
-                # Run mineru command (images are processed with OCR method)
+                # Run mineru command with device from config or kwargs (images are processed with OCR method)
+                device = kwargs.get("device", None)
+                if not device:
+                    # Try to get device from config if available
+                    try:
+                        from raganything.config import RAGAnythingConfig
+                        default_config = RAGAnythingConfig()
+                        device = default_config.device
+                    except ImportError:
+                        # Fallback to cuda:0 if config is not available
+                        device = "cuda:0"
+                
+                # Add device to kwargs for mineru command
+                kwargs["device"] = device
+
                 self._run_mineru_command(
                     input_path=actual_image_path,
                     output_dir=base_output_dir,

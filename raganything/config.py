@@ -9,6 +9,36 @@ from typing import List
 from lightrag.utils import get_env_value
 
 
+def _get_default_device() -> str:
+    """
+    Get default device for MinerU with smart GPU detection
+    
+    Returns:
+        str: Default device string (cuda:0, cpu, etc.)
+    """
+    # Check if user explicitly set the device
+    env_device = get_env_value("MINERU_DEVICE", None, str)
+    if env_device:
+        return env_device
+    
+    # Try to detect GPU availability
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda:0"
+    except ImportError:
+        # PyTorch not available, default to cuda:0 anyway
+        # MinerU will handle the fallback if GPU is not available
+        pass
+    except Exception:
+        # Any error in detection, fall back to cpu
+        return "cpu"
+    
+    # Default to cuda:0 for GPU acceleration
+    # MinerU will gracefully fallback to CPU if GPU is not available
+    return "cuda:0"
+
+
 @dataclass
 class RAGAnythingConfig:
     """Configuration class for RAGAnything with environment variable support"""
@@ -28,6 +58,10 @@ class RAGAnythingConfig:
 
     parser: str = field(default=get_env_value("PARSER", "mineru", str))
     """Parser selection: 'mineru' or 'docling'."""
+
+    device: str = field(default_factory=_get_default_device)
+    """Inference device for MinerU: 'cuda:0', 'cuda', 'cpu', 'mps', 'npu'.
+    Defaults to 'cuda:0' with automatic GPU detection and graceful CPU fallback."""
 
     display_content_stats: bool = field(
         default=get_env_value("DISPLAY_CONTENT_STATS", True, bool)
