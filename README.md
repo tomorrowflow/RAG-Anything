@@ -50,6 +50,27 @@
 
 ---
 
+<div align="center">
+  <table>
+    <tr>
+      <td style="vertical-align: middle;">
+        <img src="./assets/LiteWrite.png"
+             width="56"
+             height="56"
+             alt="LiteWrite"
+             style="border-radius: 12px;" />
+      </td>
+      <td style="vertical-align: middle; padding-left: 12px;">
+        <a href="https://litewrite.ai">
+          <img src="https://img.shields.io/badge/🚀%20LiteWrite-AI%20Native%20LaTeX%20Editor-ff6b6b?style=for-the-badge&logoColor=white&labelColor=1a1a2e">
+        </a>
+      </td>
+    </tr>
+  </table>
+</div>
+
+---
+
 ## 🎉 News
 - [X] [2025.10]🎯📢 🚀 We have released the technical report of [RAG-Anything](http://arxiv.org/abs/2510.12323). Access it now to explore our latest research findings.
 - [X] [2025.08]🎯📢 🔍 RAG-Anything now features **VLM-Enhanced Query** mode! When documents include images, the system seamlessly integrates them into VLM for advanced multimodal analysis, combining visual and textual context for deeper insights.
@@ -1087,9 +1108,9 @@ await rag.process_document_complete(
     end_page=10,                 # Ending page number (0-based, for PDF)
     formula=True,                # Enable formula parsing
     table=True,                  # Enable table parsing
-    backend="pipeline",          # Parsing backend: pipeline|vlm-transformers|vlm-sglang-engine|vlm-sglang-client.
+    backend="pipeline",          # Parsing backend: pipeline|hybrid-auto-engine|hybrid-http-client|vlm-auto-engine|vlm-http-client.
     source="huggingface",        # Model source: "huggingface", "modelscope", "local"
-    # vlm_url="http://127.0.0.1:3000" # Service address when using backend=vlm-sglang-client
+    # vlm_url="http://127.0.0.1:3000" # Service address when using backend=vlm-http-client
 
     # Standard RAGAnything parameters
     display_stats=True,          # Display content statistics
