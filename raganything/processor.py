@@ -341,15 +341,19 @@ class ProcessorMixin:
                 f"Using {self.config.parser} parser with method: {parse_method}"
             )
 
+            # Apply document parsing timeout if configured
+            parsing_timeout = self.config.document_parsing_timeout if self.config.document_parsing_timeout > 0 else None
+
             if ext in [".pdf"]:
                 self.logger.info("Detected PDF file, using parser for PDF...")
-                content_list = await asyncio.to_thread(
+                parse_coro = asyncio.to_thread(
                     doc_parser.parse_pdf,
                     pdf_path=file_path,
                     output_dir=output_dir,
                     method=parse_method,
                     **kwargs,
                 )
+                content_list = await asyncio.wait_for(parse_coro, timeout=parsing_timeout)
             elif ext in [
                 ".jpg",
                 ".jpeg",
@@ -363,12 +367,13 @@ class ProcessorMixin:
                 self.logger.info("Detected image file, using parser for images...")
                 # Use the selected parser's image parsing capability
                 if hasattr(doc_parser, "parse_image"):
-                    content_list = await asyncio.to_thread(
+                    parse_coro = asyncio.to_thread(
                         doc_parser.parse_image,
                         image_path=file_path,
                         output_dir=output_dir,
                         **kwargs,
                     )
+                    content_list = await asyncio.wait_for(parse_coro, timeout=parsing_timeout)
                 else:
                     # Fallback to MinerU for image parsing if current parser doesn't support it
                     self.logger.warning(
@@ -391,25 +396,31 @@ class ProcessorMixin:
                 self.logger.info(
                     "Detected Office or HTML document, using parser for Office/HTML..."
                 )
-                content_list = await asyncio.to_thread(
+                parse_coro = asyncio.to_thread(
                     doc_parser.parse_office_doc,
                     doc_path=file_path,
                     output_dir=output_dir,
                     **kwargs,
                 )
+                content_list = await asyncio.wait_for(parse_coro, timeout=parsing_timeout)
             else:
                 # For other or unknown formats, use generic parser
                 self.logger.info(
                     f"Using generic parser for {ext} file (method={parse_method})..."
                 )
-                content_list = await asyncio.to_thread(
+                parse_coro = asyncio.to_thread(
                     doc_parser.parse_document,
                     file_path=file_path,
                     method=parse_method,
                     output_dir=output_dir,
                     **kwargs,
                 )
+                content_list = await asyncio.wait_for(parse_coro, timeout=parsing_timeout)
 
+        except asyncio.TimeoutError:
+            timeout_msg = f"Document parsing timed out after {self.config.document_parsing_timeout}s for: {file_path}"
+            self.logger.error(timeout_msg)
+            raise TimeoutError(timeout_msg)
         except MineruExecutionError as e:
             self.logger.error(f"Mineru command failed: {e}")
             raise
@@ -520,8 +531,13 @@ class ProcessorMixin:
             # Ensure LightRAG is initialized
             await self._ensure_lightrag_initialized()
 
-            await self._process_multimodal_content_batch_type_aware(
-                multimodal_items=multimodal_items, file_path=file_path, doc_id=doc_id
+            # Apply overall multimodal processing timeout if configured
+            batch_timeout = self.config.multimodal_processing_timeout if self.config.multimodal_processing_timeout > 0 else None
+            await asyncio.wait_for(
+                self._process_multimodal_content_batch_type_aware(
+                    multimodal_items=multimodal_items, file_path=file_path, doc_id=doc_id
+                ),
+                timeout=batch_timeout,
             )
 
             # Mark multimodal content as processed and update final status
@@ -534,13 +550,24 @@ class ProcessorMixin:
                     pipeline_status["latest_message"] = log_message
                     pipeline_status["history_messages"].append(log_message)
 
-        except Exception as e:
-            self.logger.error(f"Error in multimodal processing: {e}")
-            # Fallback to individual processing if batch processing fails
+        except (Exception, asyncio.TimeoutError) as e:
+            if isinstance(e, asyncio.TimeoutError):
+                self.logger.error(
+                    f"Multimodal batch processing timed out after {self.config.multimodal_processing_timeout}s"
+                )
+            else:
+                self.logger.error(f"Error in multimodal processing: {e}")
+            # Fallback to individual processing if batch processing fails or times out
             self.logger.warning("Falling back to individual multimodal processing")
-            await self._process_multimodal_content_individual(
-                multimodal_items, file_path, doc_id
-            )
+            try:
+                await self._process_multimodal_content_individual(
+                    multimodal_items, file_path, doc_id
+                )
+            except asyncio.TimeoutError:
+                self.logger.error(
+                    "Individual multimodal processing also timed out, raising to caller"
+                )
+                raise
 
             # Mark multimodal content as processed even after fallback
             await self._mark_multimodal_processing_complete(doc_id)
@@ -588,11 +615,9 @@ class ProcessorMixin:
                     }
 
                     # Process content and get chunk results instead of immediately merging
-                    (
-                        enhanced_caption,
-                        entity_info,
-                        chunk_results,
-                    ) = await processor.process_multimodal_content(
+                    # Apply per-item vision model timeout if configured
+                    vision_timeout = self.config.vision_model_timeout if self.config.vision_model_timeout > 0 else None
+                    process_coro = processor.process_multimodal_content(
                         modal_content=item,
                         content_type=content_type,
                         file_path=file_name,
@@ -602,6 +627,11 @@ class ProcessorMixin:
                         chunk_order_index=existing_chunks_count
                         + i,  # Proper order index
                     )
+                    (
+                        enhanced_caption,
+                        entity_info,
+                        chunk_results,
+                    ) = await asyncio.wait_for(process_coro, timeout=vision_timeout)
 
                     # Collect chunk results for batch processing
                     all_chunk_results.extend(chunk_results)
@@ -619,6 +649,11 @@ class ProcessorMixin:
                         f"No suitable processor found for {content_type} type content"
                     )
 
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    f"Vision model timed out after {self.config.vision_model_timeout}s for {content_type} item {i+1}/{len(multimodal_items)}, skipping"
+                )
+                continue
             except Exception as e:
                 self.logger.error(f"Error processing multimodal content: {str(e)}")
                 self.logger.debug("Exception details:", exc_info=True)
@@ -764,15 +799,18 @@ class ProcessorMixin:
                     }
 
                     # Call the correct processor's description generation method
-                    (
-                        description,
-                        entity_info,
-                    ) = await processor.generate_description_only(
+                    # Apply per-item vision model timeout if configured
+                    vision_timeout = self.config.vision_model_timeout if self.config.vision_model_timeout > 0 else None
+                    generate_coro = processor.generate_description_only(
                         modal_content=item,
                         content_type=content_type,
                         item_info=item_info,
                         entity_name=None,  # Let LLM auto-generate
                     )
+                    (
+                        description,
+                        entity_info,
+                    ) = await asyncio.wait_for(generate_coro, timeout=vision_timeout)
 
                     # Update progress (non-blocking)
                     async with progress_lock:
@@ -811,9 +849,14 @@ class ProcessorMixin:
                                 f"Multimodal chunk generation progress: {completed_count}/{total_items} ({progress_percent:.1f}%)"
                             )
 
-                    self.logger.error(
-                        f"Error generating description for {content_type} item {index}: {e}"
-                    )
+                    if isinstance(e, asyncio.TimeoutError):
+                        self.logger.warning(
+                            f"Vision model timed out after {self.config.vision_model_timeout}s for {content_type} item {index}, skipping"
+                        )
+                    else:
+                        self.logger.error(
+                            f"Error generating description for {content_type} item {index}: {e}"
+                        )
                     return None
 
         # Process all items concurrently with correct processors

@@ -137,6 +137,23 @@ class RAGAnythingConfig:
     content_format: str = field(default=get_env_value("CONTENT_FORMAT", "minerU", str))
     """Default content format for context extraction when processing documents."""
 
+    # Timeout Configuration (seconds, 0 = no timeout)
+    # ---
+    document_parsing_timeout: int = field(
+        default=get_env_value("DOCUMENT_PARSING_TIMEOUT", 600, int)
+    )
+    """Timeout in seconds for document parsing (MinerU/Docling). 0 = no timeout."""
+
+    vision_model_timeout: int = field(
+        default=get_env_value("VISION_MODEL_TIMEOUT", 120, int)
+    )
+    """Timeout in seconds for per-item vision/LLM calls. 0 = no timeout."""
+
+    multimodal_processing_timeout: int = field(
+        default=get_env_value("MULTIMODAL_PROCESSING_TIMEOUT", 1800, int)
+    )
+    """Timeout in seconds for overall multimodal batch processing. 0 = no timeout."""
+
     # Path Handling Configuration
     # ---
     use_full_path: bool = field(default=get_env_value("USE_FULL_PATH", False, bool))
