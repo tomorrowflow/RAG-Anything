@@ -856,6 +856,25 @@ class MineruParser(Parser):
                 with open(json_file, "r", encoding="utf-8") as f:
                     content_list = json.load(f)
 
+                # Normalize MinerU 2.0 field names to expected names for backward compatibility.
+                # MinerU 2.0 renamed: img_caption -> image_caption, img_footnote -> image_footnote
+                # The codebase primarily uses image_caption/image_footnote with img_caption/img_footnote
+                # as fallback, but we ensure both fields exist so downstream code works regardless.
+                _FIELD_ALIASES = {
+                    # MinerU 1.x name -> MinerU 2.0 name (canonical)
+                    "img_caption": "image_caption",
+                    "img_footnote": "image_footnote",
+                }
+                for item in content_list:
+                    if isinstance(item, dict):
+                        for old_name, new_name in _FIELD_ALIASES.items():
+                            # If only the old field exists, copy it to the new field name
+                            if old_name in item and new_name not in item:
+                                item[new_name] = item[old_name]
+                            # If only the new field exists, copy it to the old field name (for any legacy code)
+                            elif new_name in item and old_name not in item:
+                                item[old_name] = item[new_name]
+
                 # Always fix relative paths in content_list to absolute paths
                 cls.logger.info(
                     f"Fixing image paths in {json_file} with base directory: {images_base_dir}"
@@ -872,10 +891,17 @@ class MineruParser(Parser):
                                 absolute_img_path = (
                                     images_base_dir / img_path
                                 ).resolve()
+
+                                # Security check: ensure the image path is within the base directory
+                                resolved_base = images_base_dir.resolve()
+                                if not absolute_img_path.is_relative_to(resolved_base):
+                                    cls.logger.warning(
+                                        f"Potential path traversal detected in {field_name}: {img_path}. Skipping."
+                                    )
+                                    item[field_name] = ""  # Clear unsafe path
+                                    continue
+
                                 item[field_name] = str(absolute_img_path)
-                                cls.logger.debug(
-                                    f"Updated {field_name}: {img_path} -> {item[field_name]}"
-                                )
 
             except Exception as e:
                 cls.logger.warning(f"Could not read JSON file {json_file}: {e}")
@@ -1420,18 +1446,12 @@ class DoclingParser(Parser):
         file_output_dir = Path(output_dir) / file_stem / "docling"
         file_output_dir.mkdir(parents=True, exist_ok=True)
 
-        cmd_json = [
+        cmd = [
             "docling",
             "--output",
             str(file_output_dir),
             "--to",
             "json",
-            str(input_path),
-        ]
-        cmd_md = [
-            "docling",
-            "--output",
-            str(file_output_dir),
             "--to",
             "md",
             str(input_path),
@@ -1453,13 +1473,10 @@ class DoclingParser(Parser):
             if platform.system() == "Windows":
                 docling_subprocess_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-            result_json = subprocess.run(cmd_json, **docling_subprocess_kwargs)
-            result_md = subprocess.run(cmd_md, **docling_subprocess_kwargs)
+            result = subprocess.run(cmd, **docling_subprocess_kwargs)
             self.logger.info("Docling command executed successfully")
-            if result_json.stdout:
-                self.logger.debug(f"JSON cmd output: {result_json.stdout}")
-            if result_md.stdout:
-                self.logger.debug(f"Markdown cmd output: {result_md.stdout}")
+            if result.stdout:
+                self.logger.debug(f"JSON and Markdown cmd output: {result.stdout}")
         except subprocess.CalledProcessError as e:
             self.logger.error(f"Error running docling command: {e}")
             if e.stderr:
