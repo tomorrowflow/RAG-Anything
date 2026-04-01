@@ -12,7 +12,7 @@ from typing import Dict, List, Any, Tuple, Optional
 from pathlib import Path
 
 from raganything.base import DocStatus
-from raganything.parser import MineruParser, DoclingParser, MineruExecutionError
+from raganything.parser import MineruParser, MineruExecutionError, get_parser
 from raganything.utils import (
     separate_content,
     insert_text_content,
@@ -312,6 +312,16 @@ class ProcessorMixin:
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
+        callback_file = str(file_path)
+        callback_manager = getattr(self, "callback_manager", None)
+        parse_start_time = time.time()
+        if callback_manager is not None:
+            callback_manager.dispatch(
+                "on_parse_start",
+                file_path=callback_file,
+                parser=self.config.parser,
+            )
+
         # Generate cache key based on file and configuration
         cache_key = self._generate_cache_key(file_path, parse_method, **kwargs)
 
@@ -326,15 +336,25 @@ class ProcessorMixin:
                 self.logger.info(
                     f"* Total blocks in cached content_list: {len(content_list)}"
                 )
+            if callback_manager is not None:
+                duration = time.time() - parse_start_time
+                callback_manager.dispatch(
+                    "on_parse_complete",
+                    file_path=callback_file,
+                    content_blocks=len(content_list),
+                    doc_id=doc_id,
+                    duration_seconds=duration,
+                )
             return content_list, doc_id
 
         # Choose appropriate parsing method based on file extension
         ext = file_path.suffix.lower()
 
         try:
-            doc_parser = (
-                DoclingParser() if self.config.parser == "docling" else MineruParser()
-            )
+            doc_parser = getattr(self, "doc_parser", None)
+            if doc_parser is None:
+                doc_parser = get_parser(self.config.parser)
+                self.doc_parser = doc_parser
 
             # Log parser and method information
             self.logger.info(
@@ -365,22 +385,23 @@ class ProcessorMixin:
                 ".webp",
             ]:
                 self.logger.info("Detected image file, using parser for images...")
-                # Use the selected parser's image parsing capability
-                if hasattr(doc_parser, "parse_image"):
-                    parse_coro = asyncio.to_thread(
+                try:
+                    content_list = await asyncio.to_thread(
                         doc_parser.parse_image,
                         image_path=file_path,
                         output_dir=output_dir,
                         **kwargs,
                     )
-                    content_list = await asyncio.wait_for(parse_coro, timeout=parsing_timeout)
-                else:
+                except NotImplementedError:
                     # Fallback to MinerU for image parsing if current parser doesn't support it
                     self.logger.warning(
                         f"{self.config.parser} parser doesn't support image parsing, falling back to MinerU"
                     )
-                    content_list = MineruParser().parse_image(
-                        image_path=file_path, output_dir=output_dir, **kwargs
+                    content_list = await asyncio.to_thread(
+                        MineruParser().parse_image,
+                        image_path=file_path,
+                        output_dir=output_dir,
+                        **kwargs,
                     )
             elif ext in [
                 ".doc",
@@ -423,12 +444,26 @@ class ProcessorMixin:
             raise TimeoutError(timeout_msg)
         except MineruExecutionError as e:
             self.logger.error(f"Mineru command failed: {e}")
+            if callback_manager is not None:
+                callback_manager.dispatch(
+                    "on_parse_error",
+                    file_path=callback_file,
+                    error=e,
+                    parser=self.config.parser,
+                )
             raise
         except Exception as e:
             self.logger.error(
                 f"Error during parsing with {self.config.parser} parser: {str(e)}"
             )
-            raise e
+            if callback_manager is not None:
+                callback_manager.dispatch(
+                    "on_parse_error",
+                    file_path=callback_file,
+                    error=e,
+                    parser=self.config.parser,
+                )
+            raise
 
         msg = f"Parsing {file_path} complete! Extracted {len(content_list)} content blocks"
         self.logger.info(msg)
@@ -461,6 +496,16 @@ class ProcessorMixin:
             for block_type, count in block_types.items():
                 self.logger.info(f"  - {block_type}: {count}")
 
+        if callback_manager is not None:
+            duration = time.time() - parse_start_time
+            callback_manager.dispatch(
+                "on_parse_complete",
+                file_path=callback_file,
+                content_blocks=len(content_list),
+                doc_id=doc_id,
+                duration_seconds=duration,
+            )
+
         return content_list, doc_id
 
     async def _process_multimodal_content(
@@ -485,6 +530,16 @@ class ProcessorMixin:
         if not multimodal_items:
             self.logger.debug("No multimodal content to process")
             return
+
+        callback_manager = getattr(self, "callback_manager", None)
+        mm_start_time = time.time()
+        if callback_manager is not None:
+            callback_manager.dispatch(
+                "on_multimodal_start",
+                file_path=file_path,
+                item_count=len(multimodal_items),
+                doc_id=doc_id,
+            )
 
         # Check multimodal processing status - handle LightRAG's early DocStatus.PROCESSED marking
         try:
@@ -550,14 +605,19 @@ class ProcessorMixin:
                     pipeline_status["latest_message"] = log_message
                     pipeline_status["history_messages"].append(log_message)
 
-        except (Exception, asyncio.TimeoutError) as e:
-            if isinstance(e, asyncio.TimeoutError):
-                self.logger.error(
-                    f"Multimodal batch processing timed out after {self.config.multimodal_processing_timeout}s"
+            if callback_manager is not None:
+                duration = time.time() - mm_start_time
+                callback_manager.dispatch(
+                    "on_multimodal_complete",
+                    file_path=file_path,
+                    processed_count=len(multimodal_items),
+                    duration_seconds=duration,
+                    doc_id=doc_id,
                 )
-            else:
-                self.logger.error(f"Error in multimodal processing: {e}")
-            # Fallback to individual processing if batch processing fails or times out
+
+        except Exception as e:
+            self.logger.error(f"Error in multimodal processing: {e}")
+            # Fallback to individual processing if batch processing fails
             self.logger.warning("Falling back to individual multimodal processing")
             try:
                 await self._process_multimodal_content_individual(
@@ -600,7 +660,7 @@ class ProcessorMixin:
             try:
                 content_type = item.get("type", "unknown")
                 self.logger.info(
-                    f"Processing item {i+1}/{len(multimodal_items)}: {content_type} content"
+                    f"Processing item {i + 1}/{len(multimodal_items)}: {content_type} content"
                 )
 
                 # Select appropriate processor
@@ -1170,31 +1230,32 @@ class ProcessorMixin:
 
             if current_doc_entities is None:
                 # Create new document entry
-                entity_names = list(
+                entity_names = [
                     entity_data["entity_name"]
                     for entity_data in entities_to_store.values()
-                )
+                ]
                 doc_entities_data = {
                     "entity_names": entity_names,
                     "count": len(entity_names),
                     "update_time": int(time.time()),
                 }
             else:
-                # Update existing document entry
-                existing_entity_names = set(
+                # Update existing document entry while preserving any existing
+                # metadata fields stored by the text pipeline.
+                existing_entity_names = list(
                     current_doc_entities.get("entity_names", [])
                 )
-                new_entity_names = [
-                    entity_data["entity_name"]
-                    for entity_data in entities_to_store.values()
-                ]
+                seen_entity_names = set(existing_entity_names)
 
-                # Add new multimodal entities to the list (avoid duplicates)
-                for entity_name in new_entity_names:
-                    existing_entity_names.add(entity_name)
+                for entity_data in entities_to_store.values():
+                    entity_name = entity_data["entity_name"]
+                    if entity_name not in seen_entity_names:
+                        existing_entity_names.append(entity_name)
+                        seen_entity_names.add(entity_name)
 
                 doc_entities_data = {
-                    "entity_names": list(existing_entity_names),
+                    **current_doc_entities,
+                    "entity_names": existing_entity_names,
                     "count": len(existing_entity_names),
                     "update_time": int(time.time()),
                 }
@@ -1506,70 +1567,115 @@ class ProcessorMixin:
             doc_id: Optional document ID, if not provided will be generated from content
             **kwargs: Additional parameters for parser (e.g., lang, device, start_page, end_page, formula, table, backend, source)
         """
-        # Ensure LightRAG is initialized
-        await self._ensure_lightrag_initialized()
+        callback_manager = getattr(self, "callback_manager", None)
+        doc_start_time = time.time()
+        stage = "parse"
 
-        # Use config defaults if not provided
-        if output_dir is None:
-            output_dir = self.config.parser_output_dir
-        if parse_method is None:
-            parse_method = self.config.parse_method
-        if display_stats is None:
-            display_stats = self.config.display_content_stats
+        try:
+            # Ensure LightRAG is initialized
+            await self._ensure_lightrag_initialized()
 
-        self.logger.info(f"Starting complete document processing: {file_path}")
+            # Use config defaults if not provided
+            if output_dir is None:
+                output_dir = self.config.parser_output_dir
+            if parse_method is None:
+                parse_method = self.config.parse_method
+            if display_stats is None:
+                display_stats = self.config.display_content_stats
 
-        # Step 1: Parse document
-        content_list, content_based_doc_id = await self.parse_document(
-            file_path, output_dir, parse_method, display_stats, **kwargs
-        )
+            self.logger.info(f"Starting complete document processing: {file_path}")
 
-        # Use provided doc_id or fall back to content-based doc_id
-        if doc_id is None:
-            doc_id = content_based_doc_id
-
-        # Step 2: Separate text and multimodal content
-        text_content, multimodal_items = separate_content(content_list)
-
-        # Step 2.5: Set content source for context extraction in multimodal processing
-        if hasattr(self, "set_content_source_for_context") and multimodal_items:
-            self.logger.info(
-                "Setting content source for context-aware multimodal processing..."
-            )
-            self.set_content_source_for_context(
-                content_list, self.config.content_format
+            # Step 1: Parse document
+            content_list, content_based_doc_id = await self.parse_document(
+                file_path, output_dir, parse_method, display_stats, **kwargs
             )
 
-        # Step 3: Insert pure text content with all parameters
-        if text_content.strip():
-            if file_name is None:
-                # Use full path or basename based on config
-                file_name = self._get_file_reference(file_path)
-            await insert_text_content(
-                self.lightrag,
-                input=text_content,
-                file_paths=file_name,
-                split_by_character=split_by_character,
-                split_by_character_only=split_by_character_only,
-                ids=doc_id,
-            )
-        else:
-            # Determine file reference even if no text content
-            if file_name is None:
-                file_name = self._get_file_reference(file_path)
+            # Use provided doc_id or fall back to content-based doc_id
+            if doc_id is None:
+                doc_id = content_based_doc_id
 
-        # Step 4: Process multimodal content (using specialized processors)
-        if multimodal_items:
-            await self._process_multimodal_content(multimodal_items, file_name, doc_id)
-        else:
-            # If no multimodal content, mark multimodal processing as complete
-            # This ensures the document status properly reflects completion of all processing
-            await self._mark_multimodal_processing_complete(doc_id)
-            self.logger.debug(
-                f"No multimodal content found in document {doc_id}, marked multimodal processing as complete"
-            )
+            # Step 2: Separate text and multimodal content
+            text_content, multimodal_items = separate_content(content_list)
+
+            # Step 2.5: Set content source for context extraction in multimodal processing
+            if hasattr(self, "set_content_source_for_context") and multimodal_items:
+                self.logger.info(
+                    "Setting content source for context-aware multimodal processing..."
+                )
+                self.set_content_source_for_context(
+                    content_list, self.config.content_format
+                )
+
+            # Step 3: Insert pure text content with all parameters
+            stage = "text_insert"
+            if text_content.strip():
+                if file_name is None:
+                    # Use full path or basename based on config
+                    file_name = self._get_file_reference(file_path)
+                if callback_manager is not None:
+                    callback_manager.dispatch(
+                        "on_text_insert_start",
+                        file_path=file_name,
+                        text_length=len(text_content),
+                        doc_id=doc_id,
+                    )
+                insert_start = time.time()
+                await insert_text_content(
+                    self.lightrag,
+                    input=text_content,
+                    file_paths=file_name,
+                    split_by_character=split_by_character,
+                    split_by_character_only=split_by_character_only,
+                    ids=doc_id,
+                )
+                if callback_manager is not None:
+                    insert_duration = time.time() - insert_start
+                    callback_manager.dispatch(
+                        "on_text_insert_complete",
+                        file_path=file_name,
+                        duration_seconds=insert_duration,
+                        doc_id=doc_id,
+                    )
+            else:
+                # Determine file reference even if no text content
+                if file_name is None:
+                    file_name = self._get_file_reference(file_path)
+
+            # Step 4: Process multimodal content (using specialized processors)
+            stage = "multimodal"
+            if multimodal_items:
+                await self._process_multimodal_content(
+                    multimodal_items, file_name, doc_id
+                )
+            else:
+                # If no multimodal content, mark multimodal processing as complete
+                # This ensures the document status properly reflects completion of all processing
+                await self._mark_multimodal_processing_complete(doc_id)
+                self.logger.debug(
+                    f"No multimodal content found in document {doc_id}, "
+                    "marked multimodal processing as complete",
+                )
+
+        except Exception as exc:
+            if callback_manager is not None:
+                callback_manager.dispatch(
+                    "on_document_error",
+                    file_path=str(file_path),
+                    doc_id=doc_id,
+                    stage=stage,
+                    error=exc,
+                )
+            raise
 
         self.logger.info(f"Document {file_path} processing complete!")
+        if callback_manager is not None:
+            duration = time.time() - doc_start_time
+            callback_manager.dispatch(
+                "on_document_complete",
+                file_path=str(file_path),
+                doc_id=doc_id,
+                duration_seconds=duration,
+            )
 
     async def process_document_complete_lightrag_api(
         self,
@@ -1830,6 +1936,9 @@ class ProcessorMixin:
             - page_idx represents the page number where the content appears (0-based indexing)
             - Items are processed in the order they appear in the list
         """
+        callback_manager = getattr(self, "callback_manager", None)
+        doc_start_time = time.time()
+
         # Ensure LightRAG is initialized
         await self._ensure_lightrag_initialized()
 
@@ -1878,6 +1987,14 @@ class ProcessorMixin:
         if text_content.strip():
             # Use full path or basename based on config
             file_ref = self._get_file_reference(file_path)
+            if callback_manager is not None:
+                callback_manager.dispatch(
+                    "on_text_insert_start",
+                    file_path=file_ref,
+                    text_length=len(text_content),
+                    doc_id=doc_id,
+                )
+            insert_start = time.time()
             await insert_text_content(
                 self.lightrag,
                 input=text_content,
@@ -1886,6 +2003,14 @@ class ProcessorMixin:
                 split_by_character_only=split_by_character_only,
                 ids=doc_id,
             )
+            if callback_manager is not None:
+                insert_duration = time.time() - insert_start
+                callback_manager.dispatch(
+                    "on_text_insert_complete",
+                    file_path=file_ref,
+                    duration_seconds=insert_duration,
+                    doc_id=doc_id,
+                )
         else:
             # Determine file reference even if no text content
             file_ref = self._get_file_reference(file_path)
@@ -1902,3 +2027,11 @@ class ProcessorMixin:
             )
 
         self.logger.info(f"Content list insertion complete for: {file_path}")
+        if callback_manager is not None:
+            duration = time.time() - doc_start_time
+            callback_manager.dispatch(
+                "on_document_complete",
+                file_path=file_path,
+                doc_id=doc_id,
+                duration_seconds=duration,
+            )

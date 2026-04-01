@@ -15,7 +15,7 @@ import time
 
 from tqdm import tqdm
 
-from .parser import MineruParser, DoclingParser
+from .parser import get_parser
 
 
 @dataclass
@@ -70,7 +70,7 @@ class BatchParser:
         Initialize batch parser
 
         Args:
-            parser_type: Type of parser to use ("mineru" or "docling")
+            parser_type: Type of parser to use ("mineru", "docling", or "paddleocr")
             max_workers: Maximum number of parallel workers
             show_progress: Whether to show progress bars
             timeout_per_file: Timeout in seconds for each file
@@ -83,12 +83,10 @@ class BatchParser:
         self.logger = logging.getLogger(__name__)
 
         # Initialize parser
-        if parser_type == "mineru":
-            self.parser = MineruParser()
-        elif parser_type == "docling":
-            self.parser = DoclingParser()
-        else:
-            raise ValueError(f"Unsupported parser type: {parser_type}")
+        try:
+            self.parser = get_parser(parser_type)
+        except ValueError as exc:
+            raise ValueError(f"Unsupported parser type: {parser_type}") from exc
 
         # Check parser installation (optional)
         if not skip_installation_check:
@@ -384,9 +382,14 @@ def main():
     parser.add_argument("--output", "-o", required=True, help="Output directory")
     parser.add_argument(
         "--parser",
-        choices=["mineru", "docling"],
         default="mineru",
-        help="Parser to use",
+        help=(
+            "Parser to use. Built-ins: mineru, docling, paddleocr. "
+            "When using RAGAnything as a library, any custom parsers that you "
+            "have registered via register_parser() in the current process "
+            "are also accepted. The standalone CLI itself does not perform "
+            "plugin discovery."
+        ),
     )
     parser.add_argument(
         "--method",

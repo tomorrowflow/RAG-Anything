@@ -57,7 +57,7 @@ class RAGAnythingConfig:
     """Default output directory for parsed content."""
 
     parser: str = field(default=get_env_value("PARSER", "mineru", str))
-    """Parser selection: 'mineru' or 'docling'."""
+    """Parser selection: 'mineru', 'docling', or 'paddleocr'."""
 
     device: str = field(default_factory=_get_default_device)
     """Inference device for MinerU: 'cuda:0', 'cuda', 'cpu', 'mps', 'npu'.
