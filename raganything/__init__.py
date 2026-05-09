@@ -57,11 +57,9 @@ except ModuleNotFoundError:
 except ImportError:
     pass
 
-__version__ = "1.2.10"
+__version__ = "1.3.0"
 __author__ = "Zirui Guo"
 __url__ = "https://github.com/HKUDS/RAG-Anything"
-
-__all__ = ["RAGAnything", "RAGAnythingConfig"]
 
 __all__ = [
     "RAGAnything",

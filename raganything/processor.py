@@ -91,6 +91,108 @@ class ProcessorMixin:
 
         return cache_key
 
+    @staticmethod
+    def _current_doc_status_timestamp() -> str:
+        """Return a stable UTC timestamp for doc_status bookkeeping."""
+        return time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+
+    async def _ensure_doc_status_record(
+        self,
+        doc_id: str,
+        file_path: str,
+        *,
+        scheme_name: str | None = None,
+        status: DocStatus = DocStatus.READY,
+    ) -> Dict[str, Any]:
+        """Create a minimal doc_status entry when LightRAG has not created one yet."""
+        current_doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+        if current_doc_status:
+            return current_doc_status
+
+        timestamp = self._current_doc_status_timestamp()
+        doc_status_payload: Dict[str, Any] = {
+            "status": status,
+            "content": "",
+            "content_summary": "",
+            "content_length": 0,
+            "error_msg": "",
+            "chunks_count": 0,
+            "chunks_list": [],
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "file_path": self._get_file_reference(file_path),
+        }
+        if scheme_name is not None:
+            doc_status_payload["scheme_name"] = scheme_name
+
+        await self.lightrag.doc_status.upsert({doc_id: doc_status_payload})
+        await self.lightrag.doc_status.index_done_callback()
+        return await self.lightrag.doc_status.get_by_id(doc_id) or doc_status_payload
+
+    async def _upsert_doc_status(
+        self,
+        doc_id: str,
+        file_path: str,
+        *,
+        scheme_name: str | None = None,
+        **updates,
+    ) -> Dict[str, Any]:
+        """Merge doc_status updates while preserving any existing LightRAG fields."""
+        current_doc_status = await self._ensure_doc_status_record(
+            doc_id,
+            file_path,
+            scheme_name=scheme_name,
+        )
+        updated_doc_status = {
+            **current_doc_status,
+            **updates,
+            "updated_at": self._current_doc_status_timestamp(),
+        }
+        await self.lightrag.doc_status.upsert({doc_id: updated_doc_status})
+        await self.lightrag.doc_status.index_done_callback()
+        return updated_doc_status
+
+    async def _get_multimodal_status_record(self, doc_id: str) -> Dict[str, Any] | None:
+        """Get compatibility multimodal completion state when doc_status cannot store it."""
+        if (
+            not hasattr(self, "multimodal_status_cache")
+            or self.multimodal_status_cache is None
+        ):
+            return None
+
+        return await self.multimodal_status_cache.get_by_id(doc_id)
+
+    async def _set_multimodal_status_record(self, doc_id: str, processed: bool) -> None:
+        """Persist multimodal completion state in a separate KV namespace."""
+        if (
+            not hasattr(self, "multimodal_status_cache")
+            or self.multimodal_status_cache is None
+        ):
+            return
+
+        await self.multimodal_status_cache.upsert(
+            {
+                doc_id: {
+                    "multimodal_processed": processed,
+                    "updated_at": self._current_doc_status_timestamp(),
+                }
+            }
+        )
+        await self.multimodal_status_cache.index_done_callback()
+
+    async def _get_multimodal_processed_flag(
+        self, doc_id: str, doc_status: Dict[str, Any] | None = None
+    ) -> bool:
+        """Read multimodal completion state from doc_status or compatibility cache."""
+        if doc_status is not None and "multimodal_processed" in doc_status:
+            return bool(doc_status.get("multimodal_processed", False))
+
+        compatibility_status = await self._get_multimodal_status_record(doc_id)
+        if compatibility_status is not None:
+            return bool(compatibility_status.get("multimodal_processed", False))
+
+        return False
+
     def _generate_content_based_doc_id(self, content_list: List[Dict[str, Any]]) -> str:
         """
         Generate doc_id based on document content
@@ -541,13 +643,21 @@ class ProcessorMixin:
                 doc_id=doc_id,
             )
 
+        # Ensure LightRAG is initialized before accessing its storages
+        init_result = await self._ensure_lightrag_initialized()
+        if not init_result or not init_result.get("success"):
+            self.logger.error(
+                "LightRAG initialization failed; skipping multimodal processing"
+            )
+            return
+
         # Check multimodal processing status - handle LightRAG's early DocStatus.PROCESSED marking
         try:
             existing_doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
             if existing_doc_status:
                 # Check if multimodal content is already processed
-                multimodal_processed = existing_doc_status.get(
-                    "multimodal_processed", False
+                multimodal_processed = await self._get_multimodal_processed_flag(
+                    doc_id, existing_doc_status
                 )
 
                 if multimodal_processed:
@@ -783,6 +893,8 @@ class ProcessorMixin:
                 pipeline_status=pipeline_status,
                 pipeline_status_lock=pipeline_status_lock,
                 llm_response_cache=self.lightrag.llm_response_cache,
+                entity_chunks_storage=self.lightrag.entity_chunks,
+                relation_chunks_storage=self.lightrag.relation_chunks,
                 current_file_number=1,
                 total_files=1,
                 file_path=file_name,
@@ -1395,6 +1507,8 @@ class ProcessorMixin:
             pipeline_status=pipeline_status,
             pipeline_status_lock=pipeline_status_lock,
             llm_response_cache=self.lightrag.llm_response_cache,
+            entity_chunks_storage=self.lightrag.entity_chunks,
+            relation_chunks_storage=self.lightrag.relation_chunks,
             current_file_number=1,
             total_files=1,
             file_path=file_ref,
@@ -1448,15 +1562,33 @@ class ProcessorMixin:
         try:
             current_doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
             if current_doc_status:
-                await self.lightrag.doc_status.upsert(
-                    {
-                        doc_id: {
-                            **current_doc_status,
-                            "multimodal_processed": True,
-                            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
-                        }
+                final_status = current_doc_status.get("status") or DocStatus.PROCESSED
+                if final_status != DocStatus.FAILED:
+                    final_status = DocStatus.PROCESSED
+                update_payload = {
+                    **current_doc_status,
+                    "status": final_status,
+                    "multimodal_processed": True,
+                    "updated_at": self._current_doc_status_timestamp(),
+                }
+                try:
+                    await self.lightrag.doc_status.upsert({doc_id: update_payload})
+                except Exception as exc:
+                    # Older LightRAG versions reject unknown doc_status fields such as
+                    # multimodal_processed. Fall back to a schema-compatible status-only
+                    # update so image-only and multimodal documents still complete.
+                    self.logger.debug(
+                        "Falling back to schema-compatible doc_status update for %s: %s",
+                        doc_id,
+                        exc,
+                    )
+                    fallback_payload = {
+                        **current_doc_status,
+                        "status": final_status,
+                        "updated_at": self._current_doc_status_timestamp(),
                     }
-                )
+                    await self.lightrag.doc_status.upsert({doc_id: fallback_payload})
+                    await self._set_multimodal_status_record(doc_id, True)
                 await self.lightrag.doc_status.index_done_callback()
                 self.logger.debug(
                     f"Marked multimodal content processing as complete for document {doc_id}"
@@ -1482,7 +1614,9 @@ class ProcessorMixin:
                 return False
 
             text_processed = doc_status.get("status") == DocStatus.PROCESSED
-            multimodal_processed = doc_status.get("multimodal_processed", False)
+            multimodal_processed = await self._get_multimodal_processed_flag(
+                doc_id, doc_status
+            )
 
             return text_processed and multimodal_processed
 
@@ -1514,7 +1648,9 @@ class ProcessorMixin:
                 }
 
             text_processed = doc_status.get("status") == DocStatus.PROCESSED
-            multimodal_processed = doc_status.get("multimodal_processed", False)
+            multimodal_processed = await self._get_multimodal_processed_flag(
+                doc_id, doc_status
+            )
             fully_processed = text_processed and multimodal_processed
 
             return {
@@ -1570,10 +1706,15 @@ class ProcessorMixin:
         callback_manager = getattr(self, "callback_manager", None)
         doc_start_time = time.time()
         stage = "parse"
+        file_name = file_name or self._get_file_reference(file_path)
 
         try:
             # Ensure LightRAG is initialized
-            await self._ensure_lightrag_initialized()
+            init_result = await self._ensure_lightrag_initialized()
+            if not init_result or not init_result.get("success"):
+                raise RuntimeError(
+                    f"LightRAG initialization failed: {(init_result or {}).get('error', 'unknown error')}"
+                )
 
             # Use config defaults if not provided
             if output_dir is None:
@@ -1594,6 +1735,13 @@ class ProcessorMixin:
             if doc_id is None:
                 doc_id = content_based_doc_id
 
+            await self._upsert_doc_status(
+                doc_id,
+                file_name,
+                status=DocStatus.HANDLING,
+                error_msg="",
+            )
+
             # Step 2: Separate text and multimodal content
             text_content, multimodal_items = separate_content(content_list)
 
@@ -1609,9 +1757,6 @@ class ProcessorMixin:
             # Step 3: Insert pure text content with all parameters
             stage = "text_insert"
             if text_content.strip():
-                if file_name is None:
-                    # Use full path or basename based on config
-                    file_name = self._get_file_reference(file_path)
                 if callback_manager is not None:
                     callback_manager.dispatch(
                         "on_text_insert_start",
@@ -1637,9 +1782,8 @@ class ProcessorMixin:
                         doc_id=doc_id,
                     )
             else:
-                # Determine file reference even if no text content
-                if file_name is None:
-                    file_name = self._get_file_reference(file_path)
+                # file_name was resolved before parsing so doc_status can be initialized early
+                pass
 
             # Step 4: Process multimodal content (using specialized processors)
             stage = "multimodal"
@@ -1657,6 +1801,18 @@ class ProcessorMixin:
                 )
 
         except Exception as exc:
+            if doc_id is not None:
+                try:
+                    await self._upsert_doc_status(
+                        doc_id,
+                        file_name,
+                        status=DocStatus.FAILED,
+                        error_msg=str(exc),
+                    )
+                except Exception as status_exc:
+                    self.logger.debug(
+                        f"Failed to persist doc_status error state for {doc_id}: {status_exc}"
+                    )
             if callback_manager is not None:
                 callback_manager.dispatch(
                     "on_document_error",
@@ -1708,25 +1864,61 @@ class ProcessorMixin:
         doc_pre_id = f"doc-pre-{file_name}"
         pipeline_status = None
         pipeline_status_lock = None
+        current_doc_status = {}  # initialised here so the except block can always unpack it
+
+        async def mark_initialization_failed(error_msg: str) -> None:
+            """Persist init failures when LightRAG doc_status is already available."""
+            lightrag = getattr(self, "lightrag", None)
+            doc_status = getattr(lightrag, "doc_status", None)
+            if doc_status is None:
+                self.logger.error(
+                    "LightRAG initialization failed before doc_status was available; "
+                    f"unable to persist failed status for {file_path}"
+                )
+                return
+
+            try:
+                existing_status = await doc_status.get_by_id(doc_pre_id)
+                failed_status = {
+                    "status": DocStatus.FAILED,
+                    "content": "",
+                    "error_msg": error_msg,
+                    "content_summary": "",
+                    "multimodal_content": [],
+                    "scheme_name": scheme_name,
+                    "content_length": 0,
+                    "created_at": "",
+                    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                    "file_path": file_name,
+                }
+                if existing_status:
+                    failed_status = {
+                        **existing_status,
+                        "status": DocStatus.FAILED,
+                        "error_msg": error_msg,
+                        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                    }
+                await doc_status.upsert({doc_pre_id: failed_status})
+                await doc_status.index_done_callback()
+            except Exception as status_error:
+                self.logger.error(
+                    f"Failed to persist initialization failure status for {file_path}: "
+                    f"{status_error}"
+                )
 
         if parser:
             self.config.parser = parser
 
-        current_doc_status = await self.lightrag.doc_status.get_by_id(doc_pre_id)
-
         try:
-            # Ensure LightRAG is initialized
+            # Ensure LightRAG is initialized before accessing its storages
             result = await self._ensure_lightrag_initialized()
-            if not result["success"]:
-                await self.lightrag.doc_status.upsert(
-                    {
-                        doc_pre_id: {
-                            **current_doc_status,
-                            "status": DocStatus.FAILED,
-                            "error_msg": result["error"],
-                        }
-                    }
+            if not result or not result.get("success"):
+                error_msg = (result or {}).get("error", "unknown error")
+                self.logger.error(
+                    f"LightRAG initialization failed: {error_msg}; "
+                    f"skipping document processing for {file_path}"
                 )
+                await mark_initialization_failed(str(error_msg))
                 return False
 
             # Use config defaults if not provided
@@ -1794,9 +1986,10 @@ class ProcessorMixin:
                     file_path, output_dir, parse_method, display_stats, **kwargs
                 )
             except MineruExecutionError as e:
-                error_message = e.error_msg
                 if isinstance(e.error_msg, list):
-                    error_message = "\n".join(e.error_msg)
+                    error_message = "\n".join(str(m) for m in e.error_msg)
+                else:
+                    error_message = str(e.error_msg)
                 await self.lightrag.doc_status.upsert(
                     {
                         doc_pre_id: {
@@ -1826,6 +2019,14 @@ class ProcessorMixin:
             # Use provided doc_id or fall back to content-based doc_id
             if doc_id is None:
                 doc_id = content_based_doc_id
+
+            await self._upsert_doc_status(
+                doc_id,
+                file_name,
+                scheme_name=scheme_name,
+                status=DocStatus.HANDLING,
+                error_msg="",
+            )
 
             # Step 2: Separate text and multimodal content
             text_content, multimodal_items = separate_content(content_list)
@@ -1892,15 +2093,23 @@ class ProcessorMixin:
             return False
 
         finally:
-            async with pipeline_status_lock:
-                pipeline_status.update({"scan_disabled": False})
-                pipeline_status["latest_message"] = (
-                    f"RAGAnything processing completed for {file_name}"
-                )
-                pipeline_status["history_messages"].append(
-                    f"RAGAnything processing completed for {file_name}"
-                )
-                pipeline_status["history_messages"].append("Now is allowed to scan")
+            if pipeline_status_lock is not None and pipeline_status is not None:
+                try:
+                    async with pipeline_status_lock:
+                        pipeline_status.update({"scan_disabled": False})
+                        pipeline_status["latest_message"] = (
+                            f"RAGAnything processing completed for {file_name}"
+                        )
+                        pipeline_status["history_messages"].append(
+                            f"RAGAnything processing completed for {file_name}"
+                        )
+                        pipeline_status["history_messages"].append(
+                            "Now is allowed to scan"
+                        )
+                except Exception as _finally_err:
+                    self.logger.error(
+                        f"Failed to update pipeline status in finally block: {_finally_err}"
+                    )
 
     async def insert_content_list(
         self,
@@ -1940,7 +2149,11 @@ class ProcessorMixin:
         doc_start_time = time.time()
 
         # Ensure LightRAG is initialized
-        await self._ensure_lightrag_initialized()
+        init_result = await self._ensure_lightrag_initialized()
+        if not init_result or not init_result.get("success"):
+            raise RuntimeError(
+                f"LightRAG initialization failed: {(init_result or {}).get('error', 'unknown error')}"
+            )
 
         # Use config defaults if not provided
         if display_stats is None:
@@ -1953,6 +2166,14 @@ class ProcessorMixin:
         # Generate doc_id based on content if not provided
         if doc_id is None:
             doc_id = self._generate_content_based_doc_id(content_list)
+
+        file_ref = self._get_file_reference(file_path)
+        await self._upsert_doc_status(
+            doc_id,
+            file_ref,
+            status=DocStatus.HANDLING,
+            error_msg="",
+        )
 
         # Display content statistics if requested
         if display_stats:
@@ -1985,8 +2206,6 @@ class ProcessorMixin:
 
         # Step 2: Insert pure text content with all parameters
         if text_content.strip():
-            # Use full path or basename based on config
-            file_ref = self._get_file_reference(file_path)
             if callback_manager is not None:
                 callback_manager.dispatch(
                     "on_text_insert_start",
@@ -2012,8 +2231,8 @@ class ProcessorMixin:
                     doc_id=doc_id,
                 )
         else:
-            # Determine file reference even if no text content
-            file_ref = self._get_file_reference(file_path)
+            # file_ref was resolved before insertion so doc_status can be initialized early
+            pass
 
         # Step 3: Process multimodal content (using specialized processors)
         if multimodal_items:

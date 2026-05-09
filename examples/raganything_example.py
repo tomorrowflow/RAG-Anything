@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import logging
 import logging.config
+from functools import partial
 from pathlib import Path
 
 # Add project root directory to Python path
@@ -37,7 +38,7 @@ def configure_logging():
     log_file_path = os.path.abspath(os.path.join(log_dir, "raganything_example.log"))
 
     print(f"\nRAGAnything example log file: {log_file_path}\n")
-    os.makedirs(os.path.dirname(log_dir), exist_ok=True)
+    os.makedirs(os.path.dirname(log_file_path) or ".", exist_ok=True)
 
     # Get log file max size and backup count from environment variables
     log_max_bytes = int(os.getenv("LOG_MAX_BYTES", 10485760))  # Default 10MB
@@ -116,9 +117,12 @@ async def process_with_rag(
         )
 
         # Define LLM model function
+        llm_model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+        vision_model = os.getenv("VISION_MODEL", "gpt-4o")
+
         def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs):
             return openai_complete_if_cache(
-                "gpt-4o-mini",
+                llm_model,
                 prompt,
                 system_prompt=system_prompt,
                 history_messages=history_messages,
@@ -139,7 +143,7 @@ async def process_with_rag(
             # If messages format is provided (for multimodal VLM enhanced query), use it directly
             if messages:
                 return openai_complete_if_cache(
-                    "gpt-4o",
+                    vision_model,
                     "",
                     system_prompt=None,
                     history_messages=[],
@@ -151,7 +155,7 @@ async def process_with_rag(
             # Traditional single image format
             elif image_data:
                 return openai_complete_if_cache(
-                    "gpt-4o",
+                    vision_model,
                     "",
                     system_prompt=None,
                     history_messages=[],
@@ -189,8 +193,8 @@ async def process_with_rag(
         embedding_func = EmbeddingFunc(
             embedding_dim=embedding_dim,
             max_token_size=8192,
-            func=lambda texts: openai_embed.func(
-                texts,
+            func=partial(
+                openai_embed.func,
                 model=embedding_model,
                 api_key=api_key,
                 base_url=base_url,
