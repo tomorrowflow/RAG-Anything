@@ -1735,12 +1735,10 @@ class ProcessorMixin:
             if doc_id is None:
                 doc_id = content_based_doc_id
 
-            await self._upsert_doc_status(
-                doc_id,
-                file_name,
-                status=DocStatus.HANDLING,
-                error_msg="",
-            )
+            # NOTE: do NOT upsert the content-hash doc_id here with HANDLING status.
+            # apipeline_enqueue_documents uses filter_keys to detect new vs duplicate docs;
+            # pre-creating the record causes it to be treated as a duplicate on the very
+            # first insertion attempt.
 
             # Step 2: Separate text and multimodal content
             text_content, multimodal_items = separate_content(content_list)
@@ -1887,7 +1885,7 @@ class ProcessorMixin:
                     "multimodal_content": [],
                     "scheme_name": scheme_name,
                     "content_length": 0,
-                    "created_at": "",
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
                     "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
                     "file_path": file_name,
                 }
@@ -1944,8 +1942,8 @@ class ProcessorMixin:
                             "multimodal_content": [],
                             "scheme_name": scheme_name,
                             "content_length": 0,
-                            "created_at": "",
-                            "updated_at": "",
+                            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
                             "file_path": file_name,
                         }
                     }
@@ -2020,13 +2018,10 @@ class ProcessorMixin:
             if doc_id is None:
                 doc_id = content_based_doc_id
 
-            await self._upsert_doc_status(
-                doc_id,
-                file_name,
-                scheme_name=scheme_name,
-                status=DocStatus.HANDLING,
-                error_msg="",
-            )
+            # NOTE: do NOT upsert the content-hash doc_id here with HANDLING status.
+            # apipeline_enqueue_documents uses filter_keys to detect new vs duplicate docs;
+            # pre-creating the record causes it to be treated as a duplicate on the very
+            # first insertion attempt.
 
             # Step 2: Separate text and multimodal content
             text_content, multimodal_items = separate_content(content_list)
